@@ -1,0 +1,11 @@
+services:
+  lesson-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lesson-generator
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${APP_PORT:-8000}:8000"
