@@ -23,96 +23,103 @@ class HealthResponse(BaseModel):
     strong_unavailable: list[dict[str, Any]]
 
 
-class TopicNormalizeRequest(BaseModel):
+class TopicFormRequest(BaseModel):
     user_request: str = Field(min_length=1)
 
 
-class TopicNormalizeResponse(BaseModel):
+class TopicFormResponse(BaseModel):
     topic: str
+
+
+class SubjectDefineRequest(BaseModel):
+    topic: str = Field(min_length=1)
+
+
+class SubjectDefineResponse(BaseModel):
     subject: str
 
 
-class LessonSection(BaseModel):
-    section_id: str = Field(min_length=1)
+class SectionTitle(BaseModel):
+    title: str = Field(min_length=1)
+
+
+class SectionsFormRequest(BaseModel):
+    topic: str = Field(min_length=1)
+    subject: str = Field(min_length=1)
+
+
+class SectionsFormResponse(BaseModel):
+    sections: list[SectionTitle]
+
+
+class ReferencesFormRequest(BaseModel):
+    topic: str = Field(min_length=1)
+    subject: str = Field(min_length=1)
+    sections: list[SectionTitle]
+
+
+class SectionReference(BaseModel):
+    section: str
+    reference: str
+
+
+class ReferencesFormResponse(BaseModel):
+    references: list[SectionReference]
+
+
+class SectionWithReference(BaseModel):
     title: str = Field(min_length=1)
     reference: str = Field(min_length=1)
 
 
-class OutlineCreateRequest(BaseModel):
+class TaskTypesDefineRequest(BaseModel):
     topic: str = Field(min_length=1)
     subject: str = Field(min_length=1)
-    language: str = Field(min_length=1)
-    level: str = Field(min_length=1)
-    lesson_format: str = Field(min_length=1)
-
-
-class OutlineCreateResponse(BaseModel):
-    sections: list[LessonSection]
-
-
-class OutlineImproveRequest(BaseModel):
-    topic: str = Field(min_length=1)
-    subject: str = Field(min_length=1)
-    language: str = Field(min_length=1)
-    level: str = Field(min_length=1)
-    lesson_format: str = Field(min_length=1)
-    current_sections: list[LessonSection]
-    improvement_prompt: str = Field(min_length=1)
-
-
-class OutlineImproveResponse(BaseModel):
-    sections: list[LessonSection]
-
-
-class SectionTaskTypesRequest(BaseModel):
-    topic: str = Field(min_length=1)
-    subject: str = Field(min_length=1)
-    language: str = Field(min_length=1)
-    level: str = Field(min_length=1)
-    section: LessonSection
+    sections: list[SectionWithReference]
     available_task_types: list[str] = Field(min_length=1)
 
 
-class SectionTaskTypesResponse(BaseModel):
-    section_id: str
+class SectionTaskTypes(BaseModel):
+    section: str
     task_types: list[str]
 
 
-class SectionWithTaskTypes(LessonSection):
+class TaskTypesDefineResponse(BaseModel):
+    sections: list[SectionTaskTypes]
+
+
+class SectionWithTaskTypes(BaseModel):
+    title: str = Field(min_length=1)
+    reference: str = Field(min_length=1)
     task_types: list[str] = Field(min_length=1)
 
 
 class SectionGenerateRequest(BaseModel):
     topic: str = Field(min_length=1)
     subject: str = Field(min_length=1)
-    language: str = Field(min_length=1)
-    level: str = Field(min_length=1)
     section: SectionWithTaskTypes
-    previous_sections: list[LessonSection]
-    task_schemas: dict[str, Any]
-
-
-class ImageRequestItem(BaseModel):
-    task_index: int
-    image_prompt: str = Field(min_length=1)
+    previous_sections: list[SectionWithReference]
+    next_sections: list[SectionWithReference]
 
 
 class SectionGenerateResponse(BaseModel):
-    section_id: str
     tasks: list[dict[str, dict[str, Any]]]
-    image_requests: list[ImageRequestItem] = Field(default_factory=list)
 
 
 class ImageGenerateRequest(BaseModel):
     topic: str = Field(min_length=1)
     subject: str = Field(min_length=1)
-    language: str = Field(min_length=1)
-    level: str = Field(min_length=1)
-    section: LessonSection
-    image_prompt: str = Field(min_length=1)
+    section: SectionWithReference
+    image_goal: str = Field(min_length=1)
     style: str = Field(min_length=1)
     aspect_ratio: str = Field(min_length=1)
 
 
+class ImageFile(BaseModel):
+    image_base64: str
+    mime_type: str
+    alt: str
+
+
 class ImageGenerateResponse(BaseModel):
-    file: dict[str, str]
+    file: ImageFile

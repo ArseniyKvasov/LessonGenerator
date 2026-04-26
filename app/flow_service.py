@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import random
 import re
@@ -12,17 +13,16 @@ import httpx
 
 from .ai import build_client
 from .config import get_env
-from .errors import FlowGenerationError, InvalidRequestError, ProxyError
+from .errors import FlowGenerationError, InvalidRequestError, ProxyError, TimeoutError
 from .model_availability import get_available_models, mark_model_unavailable
 from .model_strategy import SIMPLE_MODELS, STRONG_MODELS
 
 ALLOWED_SUBJECTS = {"math", "language", "physics", "chemistry", "other"}
 ALLOWED_TASK_TYPES = {"note", "test", "true_false", "file", "match_cards", "word_list", "fill_gaps"}
-TASK_TYPE_TO_MODEL = {"file": "image"}
-TASK_TYPE_FROM_MODEL = {value: key for key, value in TASK_TYPE_TO_MODEL.items()}
-SECTION_ID_RE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
+ALLOWED_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/webp"}
 UNSAFE_HTML_RE = re.compile(r"(<script|<iframe|<object|<embed|javascript:|on\w+\s*=)", re.IGNORECASE)
 PLACEHOLDER_RE = re.compile(r"\{\{([^{}]+)\}\}")
+UNDERSCORE_GAP_RE = re.compile(r"_{3,}")
 
 
 class FlowService:
@@ -31,164 +31,150 @@ class FlowService:
         self.simple_pool = [simple_model] if simple_model else list(SIMPLE_MODELS)
         self.strong_pool = [strong_model] if strong_model else list(STRONG_MODELS)
 
-    async def normalize_topic(self, user_request: str) -> dict[str, str]:
-        topic = await self._step_topic(user_request)
-        subject = await self._step_subject(topic)
-        return {"topic": topic, "subject": subject}
-
-    async def create_outline(
-        self,
-        *,
-        topic: str,
-        subject: str,
-        language: str,
-        level: str,
-        lesson_format: str,
-    ) -> list[dict[str, str]]:
-        return await self._step_outline(
-            step_name="outline_create",
-            payload={
-                "topic": topic,
-                "subject": subject,
-                "language": language,
-                "level": level,
-                "lesson_format": lesson_format,
-            },
+    async def form_topic(self, user_request: str) -> dict[str, str]:
+        topic = await self._call_json(
+            step_name="topic_form",
+            model_pool=self.simple_pool,
             prompt=(
-                "Create lesson outline. Return strict JSON only: "
-                '{"sections":[{"section_id":"form_basics","title":"Form Basics","reference":"..."}]}. '
-                "Sections count must be 3-8. section_id must be a unique slug. title must contain 1-3 words."
+                "User request is provided. Form short lesson topic. Return strict JSON only: "
+                '{"topic":"Present Continuous: Form and Usage"}. Topic must be clear and <= 120 chars.'
             ),
+            payload={"user_request": user_request},
+            validator=self._validate_topic,
         )
+        return {"topic": topic}
 
-    async def improve_outline(
-        self,
-        *,
-        topic: str,
-        subject: str,
-        language: str,
-        level: str,
-        lesson_format: str,
-        current_sections: list[dict[str, str]],
-        improvement_prompt: str,
-    ) -> list[dict[str, str]]:
-        return await self._step_outline(
-            step_name="outline_improve",
-            payload={
-                "topic": topic,
-                "subject": subject,
-                "language": language,
-                "level": level,
-                "lesson_format": lesson_format,
-                "current_sections": current_sections,
-                "improvement_prompt": improvement_prompt,
-            },
+    async def define_subject(self, topic: str) -> dict[str, str]:
+        subject = await self._call_json(
+            step_name="subject_define",
+            model_pool=self.simple_pool,
             prompt=(
-                "Improve lesson outline. Return strict JSON only: "
-                '{"sections":[{"section_id":"form_basics","title":"Form Basics","reference":"..."}]}. '
-                "Sections count must be 3-8. Keep ids unique slugs and titles 1-3 words."
+                "Lesson topic is provided. Define subject: math, language, physics, chemistry, other. "
+                'Return strict JSON only: {"subject":"language"}.'
             ),
+            payload={"topic": topic},
+            validator=self._validate_subject,
         )
+        return {"subject": subject}
 
-    async def section_task_types(
-        self,
-        *,
-        topic: str,
-        subject: str,
-        language: str,
-        level: str,
-        section: dict[str, str],
-        available_task_types: list[str],
-    ) -> list[str]:
-        allowed = self._normalize_task_types(available_task_types)
-        if not allowed:
-            raise InvalidRequestError("No valid available_task_types provided")
-
-        available_for_model = [self._to_model_task_type(task_type) for task_type in allowed]
-        return await self._call_json(
-            step_name=f"section_task_types:{section.get('section_id', 'unknown')}",
+    async def form_sections(self, *, topic: str, subject: str) -> dict[str, list[dict[str, str]]]:
+        sections = await self._call_json(
+            step_name="sections_form",
             model_pool=self.strong_pool,
             prompt=(
-                "Select task types for this lesson section. Return strict JSON only: "
-                '{"task_types":["note","fill_gaps"]}. Pick 1-3 items and use only allowed types.'
+                "Form a list of interactive lesson sections. Return strict JSON only: "
+                '{"sections":[{"title":"Form Basics"}]}. '
+                "Sections count must be 3-8. Each title must be 1-2 words. Duplicate titles are forbidden."
+            ),
+            payload={"topic": topic, "subject": subject},
+            validator=self._validate_sections,
+        )
+        return {"sections": sections}
+
+    async def form_references(
+        self,
+        *,
+        topic: str,
+        subject: str,
+        sections: list[dict[str, str]],
+    ) -> dict[str, list[dict[str, str]]]:
+        section_titles = self._validate_sections_input(sections)
+        references = await self._call_json(
+            step_name="references_form",
+            model_pool=self.strong_pool,
+            prompt=(
+                "Form lesson references for each section. Return strict JSON only: "
+                '{"references":[{"section":"Form Basics","reference":"Subject + am/is/are + Verb-ing"}]}. '
+                "Each section must have exactly one short teaching-focused reference."
             ),
             payload={
                 "topic": topic,
                 "subject": subject,
-                "language": language,
-                "level": level,
-                "section": section,
-                "available_task_types": available_for_model,
+                "sections": [{"title": title} for title in section_titles],
             },
-            validator=lambda parsed: self._validate_section_task_types(parsed, allowed),
+            validator=lambda parsed: self._validate_references(parsed, section_titles),
         )
+        return {"references": references}
+
+    async def define_task_types(
+        self,
+        *,
+        topic: str,
+        subject: str,
+        sections: list[dict[str, str]],
+        available_task_types: list[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        allowed_types = self._normalize_task_types(available_task_types)
+        if not allowed_types:
+            raise InvalidRequestError("No valid available_task_types provided")
+
+        normalized_sections = self._validate_sections_with_references_input(sections)
+        task_types_by_section = await self._call_json(
+            step_name="task_types_define",
+            model_pool=self.strong_pool,
+            prompt=(
+                "Define from 2 to 4 task types for each section and return strict JSON only: "
+                '{"sections":[{"section":"Form Basics","task_types":["note","fill_gaps"]}]}. '
+                "Task types per section must be from available_task_types, unique, and count must be 1-4."
+            ),
+            payload={
+                "topic": topic,
+                "subject": subject,
+                "sections": normalized_sections,
+                "available_task_types": allowed_types,
+            },
+            validator=lambda parsed: self._validate_task_types_result(parsed, normalized_sections, allowed_types),
+        )
+        return {"sections": task_types_by_section}
 
     async def generate_section(
         self,
         *,
         topic: str,
         subject: str,
-        language: str,
-        level: str,
         section: dict[str, Any],
         previous_sections: list[dict[str, str]],
-        task_schemas: dict[str, Any],
-    ) -> dict[str, Any]:
-        section_id = str(section.get("section_id", "")).strip()
-        selected_task_types = self._normalize_task_types([str(item) for item in section.get("task_types", [])])
-        if not section_id or not selected_task_types:
-            raise InvalidRequestError("Section must contain section_id and at least one valid task_type")
+        next_sections: list[dict[str, str]],
+    ) -> dict[str, list[dict[str, dict[str, Any]]]]:
+        validated_section = self._validate_section_for_generation(section)
+        validated_previous = self._validate_sections_with_references_input(previous_sections)
+        validated_next = self._validate_sections_with_references_input(next_sections)
 
-        section_for_model = dict(section)
-        section_for_model["task_types"] = [self._to_model_task_type(task_type) for task_type in selected_task_types]
-        schema_for_model = self._schemas_for_selected_task_types(selected_task_types, task_schemas)
-        schema_for_model = {
-            self._to_model_task_type(task_type): schema
-            for task_type, schema in schema_for_model.items()
-        }
-
-        result = await self._call_json(
-            step_name=f"section_generate:{section_id}",
+        tasks = await self._call_json(
+            step_name=f"section_generate:{validated_section['title']}",
             model_pool=self.strong_pool,
             prompt=(
-                "Generate section tasks for an educational lesson. Return strict JSON only: "
-                '{"tasks":[{"note":{"content":"..."}}],"image_requests":[{"task_index":0,"image_prompt":"..."}]}. '
+                "You are creating an interactive textbook. Return strict JSON only: "
+                '{"tasks":[{"note":{"title":"...","content":"..."}}]}. '
                 "Each task object must contain exactly one key from section.task_types. "
-                "Use task_schemas. If image content is needed and file is among task types, "
-                "you may return image_requests with prompts."
+                "Allowed keys: note, test, true_false, file, match_cards, word_list, fill_gaps."
             ),
             payload={
                 "topic": topic,
                 "subject": subject,
-                "language": language,
-                "level": level,
-                "section": section_for_model,
-                "previous_sections": previous_sections,
-                "task_schemas": schema_for_model,
+                "section": validated_section,
+                "previous_sections": validated_previous,
+                "next_sections": validated_next,
             },
-            validator=lambda parsed: self._validate_section_generate_result(
-                parsed=parsed,
-                section_id=section_id,
-                selected_task_types=selected_task_types,
-            ),
+            validator=lambda parsed: self._validate_section_generate_result(parsed, validated_section["task_types"]),
         )
-        return result
+        return {"tasks": tasks}
 
     async def generate_image(
         self,
         *,
         topic: str,
         subject: str,
-        language: str,
-        level: str,
         section: dict[str, str],
-        image_prompt: str,
+        image_goal: str,
         style: str,
         aspect_ratio: str,
-    ) -> dict[str, str]:
-        prompt = image_prompt.strip()
-        if not prompt:
-            raise InvalidRequestError("image_prompt must be non-empty")
+    ) -> dict[str, dict[str, str]]:
+        validated_section = self._validate_section_reference_input(section, field="section")
+        goal = image_goal.strip()
+        if not goal:
+            raise InvalidRequestError("image_goal must be non-empty", details={"field": "image_goal"})
+
         api_key = get_env("POLLINATIONS_API_KEY") or get_env("IMAGE_GENERATOR_API_KEY")
         if not api_key:
             raise InvalidRequestError(
@@ -199,7 +185,12 @@ class FlowService:
         endpoint = get_env("POLLINATIONS_IMAGE_API_URL", "https://gen.pollinations.ai/v1/images/generations")
         model = get_env("POLLINATIONS_IMAGE_MODEL", "flux")
         size = self._size_from_aspect_ratio(aspect_ratio)
-        composed_prompt = f"{prompt}. Style: {style}. Topic: {topic}. Subject: {subject}. Level: {level}. Language: {language}."
+
+        composed_prompt = (
+            f"Create an educational image for an English lesson. Topic: {topic}. Subject: {subject}. "
+            f"Section: {validated_section['title']}. Reference: {validated_section['reference']}. "
+            f"Goal: {goal}. Style: {style}. Aspect ratio: {aspect_ratio}."
+        )
         request_payload = {
             "model": model,
             "prompt": composed_prompt,
@@ -210,66 +201,49 @@ class FlowService:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
-                response = await client.post(endpoint, json=request_payload, headers=headers)
-                response.raise_for_status()
-            body = response.json()
-        except Exception as exc:
-            raise FlowGenerationError(f"Pollinations image generation failed: {exc}") from exc
+            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
+                generation_response = await client.post(endpoint, json=request_payload, headers=headers)
+                generation_response.raise_for_status()
+                generation_body = generation_response.json()
+        except httpx.TimeoutException as exc:
+            raise TimeoutError(f"Image generation timeout: {exc}") from exc
+        except httpx.HTTPStatusError as exc:
+            raise ProxyError(f"Image provider HTTP error {exc.response.status_code}: {exc.response.text}") from exc
+        except httpx.RequestError as exc:
+            raise ProxyError(f"Image provider request error: {exc}") from exc
+        except ValueError as exc:
+            raise ProxyError("Image provider returned invalid JSON") from exc
 
-        if not isinstance(body, dict):
-            raise FlowGenerationError("Pollinations returned invalid response format")
-        data = body.get("data")
-        if not isinstance(data, list) or not data:
-            raise FlowGenerationError("Pollinations response does not contain image data")
-        first = data[0] if isinstance(data[0], dict) else {}
-        file_url = str(first.get("url", "")).strip()
-        if not file_url:
-            raise FlowGenerationError("Pollinations response does not contain image url")
+        image_url = self._extract_pollinations_url(generation_body)
 
-        alt = self._clean_text_for_alt(prompt)
-        _ = (section,)
-        return {"file_url": file_url, "file_type": "image", "alt": alt}
+        try:
+            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True) as client:
+                image_response = await client.get(image_url)
+                image_response.raise_for_status()
+                image_bytes = image_response.content
+                header_mime = image_response.headers.get("content-type", "")
+        except httpx.TimeoutException as exc:
+            raise TimeoutError(f"Image download timeout: {exc}") from exc
+        except httpx.HTTPStatusError as exc:
+            raise ProxyError(f"Image download HTTP error {exc.response.status_code}: {exc.response.text}") from exc
+        except httpx.RequestError as exc:
+            raise ProxyError(f"Image download request error: {exc}") from exc
 
-    async def _step_topic(self, user_request: str) -> str:
-        return await self._call_json(
-            step_name="topic",
-            model_pool=self.simple_pool,
-            prompt=(
-                "User request is provided. Produce normalized lesson topic and return strict JSON only: "
-                '{"topic":"Present Continuous: Form and Usage"}.'
-            ),
-            payload={"user_request": user_request},
-            validator=self._validate_topic,
-        )
+        mime_type = self._detect_image_mime(image_bytes, header_mime)
+        if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
+            raise FlowGenerationError(
+                "Unsupported image mime type",
+                details={"field": "file.mime_type", "reason": f"mime type must be one of {sorted(ALLOWED_IMAGE_MIME_TYPES)}"},
+            )
 
-    async def _step_subject(self, topic: str) -> str:
-        return await self._call_json(
-            step_name="subject",
-            model_pool=self.simple_pool,
-            prompt=(
-                "Lesson topic is provided. Return strict JSON only: "
-                '{"subject":"language"}. Allowed values: math, language, physics, chemistry, other.'
-            ),
-            payload={"topic": topic},
-            validator=self._validate_subject,
-        )
+        if not image_bytes:
+            raise FlowGenerationError("Image provider returned empty image bytes")
 
-    async def _step_outline(
-        self,
-        *,
-        step_name: str,
-        payload: dict[str, Any],
-        prompt: str,
-    ) -> list[dict[str, str]]:
-        return await self._call_json(
-            step_name=step_name,
-            model_pool=self.strong_pool,
-            prompt=prompt,
-            payload=payload,
-            validator=self._validate_outline_sections,
-        )
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+        alt = self._clean_text_for_alt(goal)
+        return {"file": {"image_base64": image_base64, "mime_type": mime_type, "alt": alt}}
 
     async def _call_json(
         self,
@@ -317,38 +291,6 @@ class FlowService:
         raise FlowGenerationError(f"Step {step_name} failed after 3 attempts: {last_error}")
 
     @staticmethod
-    def _to_model_task_type(task_type: str) -> str:
-        return TASK_TYPE_TO_MODEL.get(task_type, task_type)
-
-    @staticmethod
-    def _to_user_task_type(task_type: str) -> str:
-        return TASK_TYPE_FROM_MODEL.get(task_type, task_type)
-
-    @staticmethod
-    def _normalize_task_type(task_type: str) -> str:
-        normalized = FlowService._to_user_task_type(str(task_type).strip())
-        return normalized
-
-    @staticmethod
-    def _normalize_task_types(task_types: list[str]) -> list[str]:
-        valid: list[str] = []
-        for task_type in task_types:
-            normalized = FlowService._normalize_task_type(task_type)
-            if normalized in ALLOWED_TASK_TYPES and normalized not in valid:
-                valid.append(normalized)
-        return valid
-
-    @staticmethod
-    def _schemas_for_selected_task_types(selected_task_types: list[str], task_schemas: dict[str, Any]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for task_type in selected_task_types:
-            schema = task_schemas.get(task_type) or task_schemas.get(FlowService._to_model_task_type(task_type))
-            if schema is None:
-                continue
-            result[task_type] = schema
-        return result
-
-    @staticmethod
     def _is_rate_limited_error(exc: Exception) -> bool:
         if isinstance(exc, ProxyError) and "429" in str(exc):
             return True
@@ -359,113 +301,285 @@ class FlowService:
     def _validate_topic(parsed: dict[str, Any]) -> str:
         topic = str(parsed.get("topic", "")).strip()
         if not topic:
-            raise FlowGenerationError("Topic is empty")
+            raise FlowGenerationError("topic is required", details={"field": "topic"})
+        if len(topic) > 120:
+            raise FlowGenerationError(
+                "topic is too long",
+                details={"field": "topic", "reason": "topic must not exceed 120 characters"},
+            )
         return topic
 
     @staticmethod
     def _validate_subject(parsed: dict[str, Any]) -> str:
         subject = str(parsed.get("subject", "")).strip().lower()
         if subject not in ALLOWED_SUBJECTS:
-            subject = "other"
+            raise FlowGenerationError(
+                "subject is invalid",
+                details={"field": "subject", "reason": "subject must be one of math, language, physics, chemistry, other"},
+            )
         return subject
 
     @staticmethod
-    def _validate_outline_sections(parsed: dict[str, Any]) -> list[dict[str, str]]:
+    def _validate_sections(parsed: dict[str, Any]) -> list[dict[str, str]]:
         raw_sections = parsed.get("sections")
         if not isinstance(raw_sections, list):
-            raise FlowGenerationError("sections must be a list")
+            raise FlowGenerationError("sections must be a list", details={"field": "sections"})
         if not (3 <= len(raw_sections) <= 8):
             raise FlowGenerationError(
-                "sections must contain 3-8 items",
+                "sections count is invalid",
                 details={"field": "sections", "reason": "count must be between 3 and 8"},
             )
 
         validated: list[dict[str, str]] = []
-        used_ids: set[str] = set()
+        used_titles: set[str] = set()
         for idx, item in enumerate(raw_sections):
             if not isinstance(item, dict):
                 raise FlowGenerationError(
                     "section must be object",
                     details={"field": f"sections[{idx}]", "reason": "section item must be object"},
                 )
-            section_id = str(item.get("section_id", "")).strip()
             title = str(item.get("title", "")).strip()
-            reference = str(item.get("reference", "")).strip()
-
-            if not section_id:
-                section_id = FlowService._slugify_section_id(title)
-
-            if not section_id or not SECTION_ID_RE.fullmatch(section_id):
-                raise FlowGenerationError(
-                    "section_id must be a slug",
-                    details={"field": f"sections[{idx}].section_id", "reason": "invalid slug format"},
-                )
-            if section_id in used_ids:
-                raise FlowGenerationError(
-                    "section_id must be unique",
-                    details={"field": f"sections[{idx}].section_id", "reason": "duplicate section_id"},
-                )
-            used_ids.add(section_id)
-
+            title_key = title.lower()
             words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", title)
-            if not (1 <= len(words) <= 3):
+            if not (1 <= len(words) <= 2):
                 raise FlowGenerationError(
-                    "title must contain 1-3 words",
+                    "title must contain 1-2 words",
                     details={"field": f"sections[{idx}].title", "reason": "invalid title length"},
                 )
-            if not reference or len(reference) > 240:
+            if title_key in used_titles:
                 raise FlowGenerationError(
-                    "reference must be a short teaching reference",
-                    details={"field": f"sections[{idx}].reference", "reason": "reference is empty or too long"},
+                    "duplicate section titles are forbidden",
+                    details={"field": f"sections[{idx}].title", "reason": "duplicate title"},
                 )
-
-            validated.append({"section_id": section_id, "title": title, "reference": reference})
+            used_titles.add(title_key)
+            validated.append({"title": title})
 
         return validated
 
     @staticmethod
-    def _validate_section_task_types(parsed: dict[str, Any], available_task_types: list[str]) -> list[str]:
-        raw = parsed.get("task_types")
-        if not isinstance(raw, list):
+    def _validate_sections_input(raw_sections: list[dict[str, str]]) -> list[str]:
+        parsed = FlowService._validate_sections({"sections": raw_sections})
+        return [item["title"] for item in parsed]
+
+    @staticmethod
+    def _validate_section_reference_input(raw: dict[str, Any], *, field: str) -> dict[str, str]:
+        if not isinstance(raw, dict):
+            raise InvalidRequestError("section must be an object", details={"field": field})
+
+        title = str(raw.get("title", "")).strip()
+        reference = str(raw.get("reference", "")).strip()
+
+        words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", title)
+        if not (1 <= len(words) <= 2):
+            raise InvalidRequestError(
+                "section title must contain 1-2 words",
+                details={"field": f"{field}.title"},
+            )
+        if not reference or len(reference) > 240:
+            raise InvalidRequestError(
+                "section reference must be short and non-empty",
+                details={"field": f"{field}.reference"},
+            )
+        return {"title": title, "reference": reference}
+
+    @staticmethod
+    def _validate_sections_with_references_input(raw_sections: list[dict[str, Any]]) -> list[dict[str, str]]:
+        if not isinstance(raw_sections, list):
+            raise InvalidRequestError("sections must be array", details={"field": "sections"})
+
+        validated: list[dict[str, str]] = []
+        used_titles: set[str] = set()
+        for idx, item in enumerate(raw_sections):
+            parsed = FlowService._validate_section_reference_input(item, field=f"sections[{idx}]")
+            title_key = parsed["title"].lower()
+            if title_key in used_titles:
+                raise InvalidRequestError(
+                    "duplicate section titles are forbidden",
+                    details={"field": f"sections[{idx}].title", "reason": "duplicate title"},
+                )
+            used_titles.add(title_key)
+            validated.append(parsed)
+
+        return validated
+
+    @staticmethod
+    def _validate_references(parsed: dict[str, Any], section_titles: list[str]) -> list[dict[str, str]]:
+        raw_references = parsed.get("references")
+        if not isinstance(raw_references, list):
+            raise FlowGenerationError("references must be a list", details={"field": "references"})
+
+        expected = {title.lower(): title for title in section_titles}
+        used: set[str] = set()
+        validated: list[dict[str, str]] = []
+
+        for idx, item in enumerate(raw_references):
+            if not isinstance(item, dict):
+                raise FlowGenerationError(
+                    "reference item must be object",
+                    details={"field": f"references[{idx}]"},
+                )
+            section = str(item.get("section", "")).strip()
+            reference = str(item.get("reference", "")).strip()
+            section_key = section.lower()
+
+            if section_key not in expected:
+                raise FlowGenerationError(
+                    "reference section is unknown",
+                    details={"field": f"references[{idx}].section", "reason": "section not found in input sections"},
+                )
+            if section_key in used:
+                raise FlowGenerationError(
+                    "reference section is duplicated",
+                    details={"field": f"references[{idx}].section", "reason": "duplicate section"},
+                )
+            if not reference or len(reference) > 240:
+                raise FlowGenerationError(
+                    "reference must be short and non-empty",
+                    details={"field": f"references[{idx}].reference", "reason": "invalid reference"},
+                )
+
+            used.add(section_key)
+            validated.append({"section": expected[section_key], "reference": reference})
+
+        if used != set(expected.keys()):
+            missing = [expected[key] for key in expected.keys() - used]
             raise FlowGenerationError(
-                "task_types must be list",
-                details={"field": "task_types", "reason": "task_types must be an array"},
+                "each section must have exactly one reference",
+                details={"field": "references", "reason": f"missing references for sections: {missing}"},
             )
 
-        normalized = []
-        allowed_set = set(available_task_types)
-        for idx, task_type in enumerate(raw):
-            task_name = FlowService._normalize_task_type(str(task_type))
-            if task_name not in allowed_set:
+        return validated
+
+    @staticmethod
+    def _normalize_task_types(task_types: list[str]) -> list[str]:
+        valid: list[str] = []
+        for task_type in task_types:
+            normalized = str(task_type).strip()
+            if normalized in ALLOWED_TASK_TYPES and normalized not in valid:
+                valid.append(normalized)
+        return valid
+
+    @staticmethod
+    def _validate_task_types_result(
+        parsed: dict[str, Any],
+        sections: list[dict[str, str]],
+        available_task_types: list[str],
+    ) -> list[dict[str, Any]]:
+        raw_sections = parsed.get("sections")
+        if not isinstance(raw_sections, list):
+            raise FlowGenerationError("sections must be a list", details={"field": "sections"})
+
+        expected_sections = {item["title"].lower(): item["title"] for item in sections}
+        used_sections: set[str] = set()
+        allowed = set(available_task_types)
+        validated: list[dict[str, Any]] = []
+
+        for idx, item in enumerate(raw_sections):
+            if not isinstance(item, dict):
                 raise FlowGenerationError(
-                    "task_type is not allowed",
-                    details={"field": f"task_types[{idx}]", "reason": "must belong to available_task_types"},
+                    "section task_types item must be object",
+                    details={"field": f"sections[{idx}]"},
                 )
-            if task_name not in normalized:
+
+            section_name = str(item.get("section", "")).strip()
+            section_key = section_name.lower()
+            if section_key not in expected_sections:
+                raise FlowGenerationError(
+                    "section is unknown",
+                    details={"field": f"sections[{idx}].section", "reason": "section not found in input"},
+                )
+            if section_key in used_sections:
+                raise FlowGenerationError(
+                    "section is duplicated",
+                    details={"field": f"sections[{idx}].section", "reason": "duplicate section"},
+                )
+
+            raw_task_types = item.get("task_types")
+            if not isinstance(raw_task_types, list):
+                raise FlowGenerationError(
+                    "task_types must be list",
+                    details={"field": f"sections[{idx}].task_types", "reason": "task_types must be an array"},
+                )
+
+            normalized: list[str] = []
+            for t_idx, task_type in enumerate(raw_task_types):
+                task_name = str(task_type).strip()
+                if task_name not in allowed:
+                    raise FlowGenerationError(
+                        "task type is not allowed",
+                        details={"field": f"sections[{idx}].task_types[{t_idx}]", "reason": "must belong to available_task_types"},
+                    )
+                if task_name in normalized:
+                    raise FlowGenerationError(
+                        "duplicate task types are forbidden",
+                        details={"field": f"sections[{idx}].task_types[{t_idx}]", "reason": "duplicate task type"},
+                    )
                 normalized.append(task_name)
 
-        if not (1 <= len(normalized) <= 3):
+            if not (1 <= len(normalized) <= 4):
+                raise FlowGenerationError(
+                    "task_types count is invalid",
+                    details={"field": f"sections[{idx}].task_types", "reason": "each section must have 1-4 task types"},
+                )
+
+            used_sections.add(section_key)
+            validated.append({"section": expected_sections[section_key], "task_types": normalized})
+
+        if used_sections != set(expected_sections.keys()):
+            missing = [expected_sections[key] for key in expected_sections.keys() - used_sections]
             raise FlowGenerationError(
-                "task_types must contain 1-3 items",
-                details={"field": "task_types", "reason": "invalid number of selected task types"},
+                "each section must have task types",
+                details={"field": "sections", "reason": f"missing task types for sections: {missing}"},
             )
-        return normalized
+
+        return validated
+
+    @staticmethod
+    def _validate_section_for_generation(raw: dict[str, Any]) -> dict[str, Any]:
+        base = FlowService._validate_section_reference_input(raw, field="section")
+        raw_task_types = raw.get("task_types")
+        if not isinstance(raw_task_types, list):
+            raise InvalidRequestError("section.task_types must be array", details={"field": "section.task_types"})
+
+        normalized = []
+        for idx, task_type in enumerate(raw_task_types):
+            task_name = str(task_type).strip()
+            if task_name not in ALLOWED_TASK_TYPES:
+                raise InvalidRequestError(
+                    "task type is invalid",
+                    details={"field": f"section.task_types[{idx}]", "reason": "unsupported task type"},
+                )
+            if task_name in normalized:
+                raise InvalidRequestError(
+                    "duplicate task types are forbidden",
+                    details={"field": f"section.task_types[{idx}]", "reason": "duplicate task type"},
+                )
+            normalized.append(task_name)
+
+        if not (1 <= len(normalized) <= 4):
+            raise InvalidRequestError(
+                "section.task_types count is invalid",
+                details={"field": "section.task_types", "reason": "must contain 1-4 task types"},
+            )
+
+        base["task_types"] = normalized
+        return base
 
     @staticmethod
     def _validate_section_generate_result(
-        *,
         parsed: dict[str, Any],
-        section_id: str,
         selected_task_types: list[str],
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, dict[str, Any]]]:
         raw_tasks = parsed.get("tasks")
-        if not isinstance(raw_tasks, list):
+        if not isinstance(raw_tasks, list) or not raw_tasks:
             raise FlowGenerationError(
-                "tasks must be list",
-                details={"field": "tasks", "reason": "tasks must be an array"},
+                "tasks must be non-empty list",
+                details={"field": "tasks", "reason": "tasks must be an array with at least one task"},
             )
 
         validated_tasks: list[dict[str, dict[str, Any]]] = []
+        used_task_types: set[str] = set()
+
         for task_index, task in enumerate(raw_tasks):
             normalized_task = FlowService._normalize_task_object(task)
             if normalized_task is None:
@@ -473,70 +587,33 @@ class FlowService:
                     "task object must contain exactly one task type key",
                     details={"field": f"tasks[{task_index}]", "reason": "invalid task object shape"},
                 )
+
             task_type, data = next(iter(normalized_task.items()))
             if task_type not in selected_task_types:
                 raise FlowGenerationError(
-                    "task type not selected for section",
+                    "task type not requested for section",
                     details={"field": f"tasks[{task_index}].{task_type}", "reason": "task type is not in section.task_types"},
                 )
+
             FlowService._validate_task_payload(task_type=task_type, data=data, task_index=task_index)
             validated_tasks.append({task_type: data})
+            used_task_types.add(task_type)
 
-        image_requests = FlowService._validate_image_requests(parsed.get("image_requests"), len(validated_tasks))
-        return {"section_id": section_id, "tasks": validated_tasks, "image_requests": image_requests}
-
-    @staticmethod
-    def _validate_image_requests(raw: Any, task_count: int) -> list[dict[str, Any]]:
-        if raw is None:
-            return []
-        if not isinstance(raw, list):
+        missing_types = set(selected_task_types) - used_task_types
+        if missing_types:
             raise FlowGenerationError(
-                "image_requests must be list",
-                details={"field": "image_requests", "reason": "image_requests must be an array"},
+                "tasks do not cover requested task types",
+                details={"field": "tasks", "reason": f"missing task types: {sorted(missing_types)}"},
             )
-        result: list[dict[str, Any]] = []
-        for idx, item in enumerate(raw):
-            if not isinstance(item, dict):
-                raise FlowGenerationError(
-                    "image_request must be object",
-                    details={"field": f"image_requests[{idx}]", "reason": "item must be object"},
-                )
-            task_index = item.get("task_index")
-            image_prompt = str(item.get("image_prompt", "")).strip()
-            if not isinstance(task_index, int) or task_index < 0:
-                raise FlowGenerationError(
-                    "task_index must be a non-negative integer",
-                    details={"field": f"image_requests[{idx}].task_index", "reason": "invalid task index"},
-                )
-            if task_count > 0 and task_index > task_count:
-                raise FlowGenerationError(
-                    "task_index is out of range",
-                    details={"field": f"image_requests[{idx}].task_index", "reason": "task_index points outside tasks"},
-                )
-            if not image_prompt:
-                raise FlowGenerationError(
-                    "image_prompt is required",
-                    details={"field": f"image_requests[{idx}].image_prompt", "reason": "image_prompt must be non-empty"},
-                )
-            result.append({"task_index": task_index, "image_prompt": image_prompt})
-        return result
+
+        return validated_tasks
 
     @staticmethod
     def _normalize_task_object(task: Any) -> dict[str, dict[str, Any]] | None:
-        if not isinstance(task, dict):
-            return None
-
-        if "type" in task and "data" in task:
-            task_type = FlowService._normalize_task_type(str(task.get("type", "")).strip())
-            payload = task.get("data")
-            if task_type and isinstance(payload, dict):
-                return {task_type: payload}
-            return None
-
-        if len(task) != 1:
+        if not isinstance(task, dict) or len(task) != 1:
             return None
         task_type, payload = next(iter(task.items()))
-        task_name = FlowService._normalize_task_type(str(task_type).strip())
+        task_name = str(task_type).strip()
         if task_name not in ALLOWED_TASK_TYPES or not isinstance(payload, dict):
             return None
         return {task_name: payload}
@@ -544,7 +621,13 @@ class FlowService:
     @staticmethod
     def _validate_task_payload(*, task_type: str, data: dict[str, Any], task_index: int) -> None:
         if task_type == "note":
+            title = str(data.get("title", "")).strip()
             content = str(data.get("content", "")).strip()
+            if not title:
+                raise FlowGenerationError(
+                    "note.title is required",
+                    details={"field": f"tasks[{task_index}].note.title", "reason": "title must be non-empty"},
+                )
             if not content:
                 raise FlowGenerationError(
                     "note.content is required",
@@ -624,18 +707,27 @@ class FlowService:
             return
 
         if task_type == "file":
-            file_url = str(data.get("file_url", "")).strip()
-            file_type = str(data.get("file_type", "")).strip().lower()
+            image_base64 = str(data.get("image_base64", "")).strip()
+            mime_type = str(data.get("mime_type", "")).strip().lower()
             alt = str(data.get("alt", "")).strip()
-            if not file_url:
+
+            if not image_base64:
                 raise FlowGenerationError(
-                    "file_url is required",
-                    details={"field": f"tasks[{task_index}].file.file_url", "reason": "file_url must be non-empty"},
+                    "image_base64 is required",
+                    details={"field": f"tasks[{task_index}].file.image_base64", "reason": "image_base64 must be non-empty"},
                 )
-            if file_type != "image":
+            try:
+                base64.b64decode(image_base64, validate=True)
+            except Exception as exc:
                 raise FlowGenerationError(
-                    "file_type must be image",
-                    details={"field": f"tasks[{task_index}].file.file_type", "reason": "file_type must be 'image'"},
+                    "image_base64 is invalid",
+                    details={"field": f"tasks[{task_index}].file.image_base64", "reason": "invalid base64"},
+                ) from exc
+
+            if mime_type not in ALLOWED_IMAGE_MIME_TYPES:
+                raise FlowGenerationError(
+                    "mime_type is invalid",
+                    details={"field": f"tasks[{task_index}].file.mime_type", "reason": "mime_type must be image/png, image/jpeg or image/webp"},
                 )
             if not alt:
                 raise FlowGenerationError(
@@ -697,32 +789,45 @@ class FlowService:
                     details={"field": f"tasks[{task_index}].fill_gaps.content", "reason": "content must be non-empty"},
                 )
             FlowService._ensure_safe_markdown(content, field=f"tasks[{task_index}].fill_gaps.content")
-            placeholders = [match.group(1).strip() for match in PLACEHOLDER_RE.finditer(content)]
-            if not placeholders:
-                raise FlowGenerationError(
-                    "fill_gaps.content must contain placeholders",
-                    details={"field": f"tasks[{task_index}].fill_gaps.content", "reason": "expected {{answer}} placeholders"},
-                )
-            if not isinstance(answers, list) or not all(isinstance(item, str) and item.strip() for item in answers):
+            if not isinstance(answers, list) or not answers or not all(isinstance(item, str) and item.strip() for item in answers):
                 raise FlowGenerationError(
                     "fill_gaps.answers must be a non-empty string list",
                     details={"field": f"tasks[{task_index}].fill_gaps.answers", "reason": "answers format is invalid"},
                 )
+
             normalized_answers = [item.strip() for item in answers]
-            if len(normalized_answers) != len(placeholders):
+            placeholder_answers = [match.group(1).strip() for match in PLACEHOLDER_RE.finditer(content)]
+            if placeholder_answers:
+                if len(normalized_answers) != len(placeholder_answers):
+                    raise FlowGenerationError(
+                        "answers count does not match placeholders count",
+                        details={
+                            "field": f"tasks[{task_index}].fill_gaps.answers",
+                            "reason": "answers count does not match blanks count",
+                        },
+                    )
+                if normalized_answers != placeholder_answers:
+                    raise FlowGenerationError(
+                        "answers order does not match placeholders order",
+                        details={
+                            "field": f"tasks[{task_index}].fill_gaps.answers",
+                            "reason": "answers must match blanks in order",
+                        },
+                    )
+                return
+
+            underscore_gaps = UNDERSCORE_GAP_RE.findall(content)
+            if not underscore_gaps:
                 raise FlowGenerationError(
-                    "answers count does not match placeholders count",
-                    details={
-                        "field": f"tasks[{task_index}].fill_gaps.answers",
-                        "reason": "answers count does not match placeholders count",
-                    },
+                    "fill_gaps.content must contain blanks",
+                    details={"field": f"tasks[{task_index}].fill_gaps.content", "reason": "expected blanks like ___ or {{answer}}"},
                 )
-            if normalized_answers != placeholders:
+            if len(normalized_answers) != len(underscore_gaps):
                 raise FlowGenerationError(
-                    "answers order does not match placeholders order",
+                    "answers count does not match blanks count",
                     details={
                         "field": f"tasks[{task_index}].fill_gaps.answers",
-                        "reason": "answers order must follow placeholders order",
+                        "reason": "answers count does not match blanks count",
                     },
                 )
             return
@@ -741,20 +846,38 @@ class FlowService:
             )
 
     @staticmethod
-    def _slugify_section_id(raw: str) -> str:
-        value = raw.strip().lower()
-        if not value:
-            return ""
-        value = re.sub(r"[^a-z0-9]+", "_", value)
-        value = re.sub(r"_+", "_", value).strip("_")
-        return value
+    def _extract_pollinations_url(body: dict[str, Any]) -> str:
+        if not isinstance(body, dict):
+            raise FlowGenerationError("Image provider returned invalid response format")
+        data = body.get("data")
+        if not isinstance(data, list) or not data:
+            raise FlowGenerationError("Image provider response does not contain image data")
+        first = data[0] if isinstance(data[0], dict) else {}
+        image_url = str(first.get("url", "")).strip()
+        if not image_url:
+            raise FlowGenerationError("Image provider response does not contain image url")
+        return image_url
+
+    @staticmethod
+    def _detect_image_mime(image_bytes: bytes, header_content_type: str) -> str:
+        header_mime = header_content_type.split(";", 1)[0].strip().lower()
+        if header_mime in ALLOWED_IMAGE_MIME_TYPES:
+            return header_mime
+
+        if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if image_bytes.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+            return "image/webp"
+        return header_mime or ""
 
     @staticmethod
     def _clean_text_for_alt(text: str) -> str:
         clean = re.sub(r"\s+", " ", text).strip()
         clean = re.sub(r"[{}*#`_]+", "", clean)
-        if len(clean) > 140:
-            clean = clean[:140].rstrip() + "..."
+        if len(clean) > 180:
+            clean = clean[:180].rstrip() + "..."
         return clean or "Generated educational image."
 
     @staticmethod

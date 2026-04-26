@@ -19,8 +19,13 @@ class ConfigError(AppError):
 
 
 class ProxyError(AppError):
-    code = "internal_error"
-    status_code = 500
+    code = "provider_error"
+    status_code = 502
+
+
+class TimeoutError(AppError):
+    code = "timeout"
+    status_code = 504
 
 
 class FlowGenerationError(AppError):

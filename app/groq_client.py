@@ -4,7 +4,7 @@ from typing import Optional
 
 import httpx
 
-from .errors import ProxyError
+from .errors import ProxyError, TimeoutError
 
 
 class GroqClient:
@@ -49,6 +49,8 @@ class GroqClient:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(self.api_url, headers=headers, json=payload)
                 response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise TimeoutError(f"Proxy timeout: {exc}") from exc
         except httpx.HTTPStatusError as exc:
             details = exc.response.text
             raise ProxyError(f"Proxy HTTP error {exc.response.status_code}: {details}") from exc

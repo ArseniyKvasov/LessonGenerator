@@ -1,224 +1,284 @@
-# ML Service API Contract
+# ML API Contract
 
-Base URL: `/`
+ML service is stateless.
+Backend stores jobs, progress, sections, files and final lessons.
 
 ## Common Error Format
+
 ```json
 {
   "error": {
-    "code": "invalid_generation_result",
-    "message": "Generated content does not match expected schema.",
-    "details": {
-      "field": "tasks[1].fill_gaps.answers",
-      "reason": "answers count does not match placeholders count"
-    }
+    "code": "invalid_request | invalid_generation_result | internal_error | provider_error | timeout",
+    "message": "Human-readable error message.",
+    "details": {}
   }
 }
 ```
 
-Error codes used by this ML service:
-- `400 invalid_request`
-- `401 unauthorized`
-- `422 invalid_generation_result`
-- `500 internal_error`
+## Available Task Types
 
-## GET `/health/`
-Technical health endpoint for model pools.
+- `note`
+- `test`
+- `true_false`
+- `file`
+- `match_cards`
+- `word_list`
+- `fill_gaps`
 
-## POST `/ml/lesson/topic/normalize/`
+## Task JSON Schemas
 
-Request:
+### `note`
 ```json
 {
-  "user_request": "Present Continuous"
+  "note": {
+    "title": "str",
+    "content": "str markdown"
+  }
 }
 ```
 
-Response 200:
+### `test`
+```json
+{
+  "test": {
+    "questions": [
+      {
+        "question": "str",
+        "options": [
+          {
+            "option": "str",
+            "is_correct": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### `true_false`
+```json
+{
+  "true_false": {
+    "statements": [
+      {
+        "statement": "str",
+        "is_true": true
+      }
+    ]
+  }
+}
+```
+
+### `file`
+```json
+{
+  "file": {
+    "image_base64": "str",
+    "mime_type": "image/png | image/jpeg | image/webp",
+    "alt": "str"
+  }
+}
+```
+
+### `match_cards`
+```json
+{
+  "match_cards": {
+    "pairs": [
+      {
+        "left": "str",
+        "right": "str"
+      }
+    ]
+  }
+}
+```
+
+### `word_list`
+```json
+{
+  "word_list": {
+    "pairs": [
+      {
+        "word": "str",
+        "translation": "str"
+      }
+    ]
+  }
+}
+```
+
+### `fill_gaps`
+```json
+{
+  "fill_gaps": {
+    "content": "str markdown",
+    "answers": ["str"]
+  }
+}
+```
+
+## Endpoints
+
+### POST `/ml/lesson/topic/form/`
+Request:
+```json
+{ "user_request": "Present Continuous" }
+```
+Response:
+```json
+{ "topic": "Present Continuous: Form and Usage" }
+```
+
+### POST `/ml/lesson/subject/define/`
+Request:
+```json
+{ "topic": "Present Continuous: Form and Usage" }
+```
+Response:
+```json
+{ "subject": "language" }
+```
+
+### POST `/ml/lesson/sections/form/`
+Request:
 ```json
 {
   "topic": "Present Continuous: Form and Usage",
   "subject": "language"
 }
 ```
-
-## POST `/ml/lesson/outline/create/`
-
-Request:
-```json
-{
-  "topic": "Present Continuous: Form and Usage",
-  "subject": "language",
-  "language": "english",
-  "level": "A2",
-  "lesson_format": "short"
-}
-```
-
-Response 200:
+Response:
 ```json
 {
   "sections": [
-    {
-      "section_id": "form_basics",
-      "title": "Form Basics",
-      "reference": "Subject + am/is/are + verb-ing"
-    }
+    { "title": "Form Basics" },
+    { "title": "Usage Rules" },
+    { "title": "Signal Words" }
   ]
 }
 ```
 
-Validation:
-- `sections`: 3-8 items
-- `section_id`: unique slug
-- `title`: 1-3 words
-- `reference`: short teaching reference
-
-## POST `/ml/lesson/outline/improve/`
-
+### POST `/ml/lesson/references/form/`
 Request:
 ```json
 {
   "topic": "Present Continuous: Form and Usage",
   "subject": "language",
-  "language": "english",
-  "level": "A2",
-  "lesson_format": "short",
-  "current_sections": [
-    {
-      "section_id": "form_basics",
-      "title": "Form Basics",
-      "reference": "Subject + am/is/are + verb-ing"
-    }
+  "sections": [
+    { "title": "Form Basics" },
+    { "title": "Usage Rules" }
+  ]
+}
+```
+Response:
+```json
+{
+  "references": [
+    { "section": "Form Basics", "reference": "Subject + am/is/are + Verb-ing" },
+    { "section": "Usage Rules", "reference": "Actions happening now or temporary situations" }
+  ]
+}
+```
+
+### POST `/ml/lesson/task-types/define/`
+Request:
+```json
+{
+  "topic": "Present Continuous: Form and Usage",
+  "subject": "language",
+  "sections": [
+    { "title": "Form Basics", "reference": "Subject + am/is/are + Verb-ing" },
+    { "title": "Usage Rules", "reference": "Actions happening now or temporary situations" }
   ],
-  "improvement_prompt": "Add more speaking practice and make it easier"
+  "available_task_types": ["note", "test", "true_false", "file", "match_cards", "word_list", "fill_gaps"]
 }
 ```
-
-Response 200:
+Response:
 ```json
 {
   "sections": [
-    {
-      "section_id": "form_basics",
-      "title": "Form Basics",
-      "reference": "Subject + am/is/are + verb-ing"
-    }
+    { "section": "Form Basics", "task_types": ["note", "fill_gaps"] },
+    { "section": "Usage Rules", "task_types": ["note", "true_false"] }
   ]
 }
 ```
 
-## POST `/ml/lesson/section/task-types/`
-
+### POST `/ml/lesson/section/generate/`
 Request:
 ```json
 {
   "topic": "Present Continuous: Form and Usage",
   "subject": "language",
-  "language": "english",
-  "level": "A2",
   "section": {
-    "section_id": "form_basics",
     "title": "Form Basics",
-    "reference": "Subject + am/is/are + verb-ing"
-  },
-  "available_task_types": [
-    "note",
-    "test",
-    "true_false",
-    "file",
-    "match_cards",
-    "word_list",
-    "fill_gaps"
-  ]
-}
-```
-
-Response 200:
-```json
-{
-  "section_id": "form_basics",
-  "task_types": ["note", "fill_gaps"]
-}
-```
-
-Validation:
-- `task_types`: 1-3 items
-- each type must be from `available_task_types`
-
-## POST `/ml/lesson/section/generate/`
-
-Request:
-```json
-{
-  "topic": "Present Continuous: Form and Usage",
-  "subject": "language",
-  "language": "english",
-  "level": "A2",
-  "section": {
-    "section_id": "form_basics",
-    "title": "Form Basics",
-    "reference": "Subject + am/is/are + verb-ing",
+    "reference": "Subject + am/is/are + Verb-ing",
     "task_types": ["note", "fill_gaps"]
   },
   "previous_sections": [],
-  "task_schemas": {
-    "note": { "content": "str markdown" },
-    "fill_gaps": {
-      "content": "str markdown with {{answer}}",
-      "answers": ["str"]
-    }
-  }
+  "next_sections": [
+    { "title": "Usage Rules", "reference": "Actions happening now or temporary situations" }
+  ]
 }
 ```
-
-Response 200:
+Response:
 ```json
 {
-  "section_id": "form_basics",
   "tasks": [
     {
       "note": {
-        "content": "Use **am/is/are + verb-ing** to form the Present Continuous."
+        "title": "Present Continuous Structure",
+        "content": "Use **Subject + am/is/are + Verb-ing**."
       }
-    }
-  ],
-  "image_requests": [
+    },
     {
-      "task_index": 0,
-      "image_prompt": "A clean educational illustration of a classroom."
+      "fill_gaps": {
+        "content": "I ___ reading now.",
+        "answers": ["am"]
+      }
     }
   ]
 }
 ```
 
-## POST `/ml/lesson/file/image/generate/`
-
+### POST `/ml/lesson/image/generate/`
 Request:
 ```json
 {
   "topic": "Present Continuous: Form and Usage",
   "subject": "language",
-  "language": "english",
-  "level": "A2",
   "section": {
-    "section_id": "speaking_practice",
     "title": "Speaking Practice",
-    "reference": "Describe current actions using Present Continuous"
+    "reference": "Describe current actions in the room"
   },
-  "image_prompt": "A clean educational illustration of a classroom where students are reading, writing, and talking.",
+  "image_goal": "Create an image for speaking practice. Students should be able to describe actions using Present Continuous.",
   "style": "clean educational illustration",
   "aspect_ratio": "16:9"
 }
 ```
-
-Response 200:
+Response:
 ```json
 {
   "file": {
-    "file_url": "https://cdn.example.com/generated/classroom-actions.png",
-    "file_type": "image",
-    "alt": "Students are doing different activities in a classroom."
+    "image_base64": "iVBORw0KGgoAAAANSUhEUgAA...",
+    "mime_type": "image/png",
+    "alt": "A classroom scene where students are reading, writing, talking and looking at a laptop."
   }
 }
 ```
+
+## Validation Rules
+
+- Topic: max 120 chars.
+- Subject: one of `math | language | physics | chemistry | other`.
+- Sections: 3-8; title is 1-2 words; no duplicates.
+- References: exactly one per section; short teaching-focused text.
+- Task types: 1-4 per section; from available list; no duplicates.
+- Section tasks: each task has exactly one allowed key and belongs to requested `task_types`.
+- `test`: 1-5 questions; 2-4 options; exactly one correct option.
+- `true_false`: 2-8 statements.
+- `match_cards`: 2-8 pairs.
+- `word_list`: 3-12 pairs.
+- `fill_gaps`: markdown content, answers are string array and must match blanks order.
+- `file`: `image_base64` required, `mime_type` in `image/png|image/jpeg|image/webp`, `alt` required.

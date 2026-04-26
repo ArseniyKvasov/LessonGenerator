@@ -17,16 +17,18 @@ from app.schemas import (
     HealthResponse,
     ImageGenerateRequest,
     ImageGenerateResponse,
-    OutlineCreateRequest,
-    OutlineCreateResponse,
-    OutlineImproveRequest,
-    OutlineImproveResponse,
+    ReferencesFormRequest,
+    ReferencesFormResponse,
     SectionGenerateRequest,
     SectionGenerateResponse,
-    SectionTaskTypesRequest,
-    SectionTaskTypesResponse,
-    TopicNormalizeRequest,
-    TopicNormalizeResponse,
+    SectionsFormRequest,
+    SectionsFormResponse,
+    SubjectDefineRequest,
+    SubjectDefineResponse,
+    TaskTypesDefineRequest,
+    TaskTypesDefineResponse,
+    TopicFormRequest,
+    TopicFormResponse,
 )
 
 logging.basicConfig(
@@ -37,8 +39,8 @@ logger = logging.getLogger("lesson-generator")
 
 app = FastAPI(
     title="Lesson Generator ML API",
-    version="2.0.0",
-    description="Stateless ML service for lesson topic normalization, outline and section generation.",
+    version="3.0.0",
+    description="Stateless ML service for lesson generation flow.",
 )
 
 
@@ -58,7 +60,7 @@ async def optional_auth_middleware(request: Request, call_next):
         if provided_api_key != expected_api_key:
             return _error_response(
                 status_code=401,
-                code="unauthorized",
+                code="invalid_request",
                 message="Valid API key is required",
             )
     return await call_next(request)
@@ -106,86 +108,75 @@ async def health():
     }
 
 
-@app.post("/ml/lesson/topic/normalize/", response_model=TopicNormalizeResponse)
-async def normalize_topic(payload: TopicNormalizeRequest):
+@app.post("/ml/lesson/topic/form/", response_model=TopicFormResponse)
+async def form_topic(payload: TopicFormRequest):
     ensure_base_capacity()
     service = FlowService()
-    return await service.normalize_topic(payload.user_request.strip())
+    return await service.form_topic(payload.user_request.strip())
 
 
-@app.post("/ml/lesson/outline/create/", response_model=OutlineCreateResponse)
-async def create_outline(payload: OutlineCreateRequest):
+@app.post("/ml/lesson/subject/define/", response_model=SubjectDefineResponse)
+async def define_subject(payload: SubjectDefineRequest):
     ensure_base_capacity()
     service = FlowService()
-    sections = await service.create_outline(
+    return await service.define_subject(payload.topic.strip())
+
+
+@app.post("/ml/lesson/sections/form/", response_model=SectionsFormResponse)
+async def form_sections(payload: SectionsFormRequest):
+    ensure_base_capacity()
+    service = FlowService()
+    return await service.form_sections(
         topic=payload.topic.strip(),
-        subject=payload.subject.strip(),
-        language=payload.language.strip(),
-        level=payload.level.strip(),
-        lesson_format=payload.lesson_format.strip(),
+        subject=payload.subject.strip().lower(),
     )
-    return {"sections": sections}
 
 
-@app.post("/ml/lesson/outline/improve/", response_model=OutlineImproveResponse)
-async def improve_outline(payload: OutlineImproveRequest):
+@app.post("/ml/lesson/references/form/", response_model=ReferencesFormResponse)
+async def form_references(payload: ReferencesFormRequest):
     ensure_base_capacity()
     service = FlowService()
-    sections = await service.improve_outline(
+    return await service.form_references(
         topic=payload.topic.strip(),
-        subject=payload.subject.strip(),
-        language=payload.language.strip(),
-        level=payload.level.strip(),
-        lesson_format=payload.lesson_format.strip(),
-        current_sections=[section.model_dump() for section in payload.current_sections],
-        improvement_prompt=payload.improvement_prompt.strip(),
+        subject=payload.subject.strip().lower(),
+        sections=[section.model_dump() for section in payload.sections],
     )
-    return {"sections": sections}
 
 
-@app.post("/ml/lesson/section/task-types/", response_model=SectionTaskTypesResponse)
-async def define_section_task_types(payload: SectionTaskTypesRequest):
+@app.post("/ml/lesson/task-types/define/", response_model=TaskTypesDefineResponse)
+async def define_task_types(payload: TaskTypesDefineRequest):
     ensure_base_capacity()
     service = FlowService()
-    task_types = await service.section_task_types(
+    return await service.define_task_types(
         topic=payload.topic.strip(),
-        subject=payload.subject.strip(),
-        language=payload.language.strip(),
-        level=payload.level.strip(),
-        section=payload.section.model_dump(),
-        available_task_types=[item.strip() for item in payload.available_task_types],
+        subject=payload.subject.strip().lower(),
+        sections=[section.model_dump() for section in payload.sections],
+        available_task_types=[task_type.strip() for task_type in payload.available_task_types],
     )
-    return {"section_id": payload.section.section_id, "task_types": task_types}
 
 
 @app.post("/ml/lesson/section/generate/", response_model=SectionGenerateResponse)
 async def generate_section(payload: SectionGenerateRequest):
     ensure_base_capacity()
     service = FlowService()
-    generated = await service.generate_section(
+    return await service.generate_section(
         topic=payload.topic.strip(),
-        subject=payload.subject.strip(),
-        language=payload.language.strip(),
-        level=payload.level.strip(),
+        subject=payload.subject.strip().lower(),
         section=payload.section.model_dump(),
         previous_sections=[section.model_dump() for section in payload.previous_sections],
-        task_schemas=payload.task_schemas,
+        next_sections=[section.model_dump() for section in payload.next_sections],
     )
-    return generated
 
 
-@app.post("/ml/lesson/file/image/generate/", response_model=ImageGenerateResponse)
+@app.post("/ml/lesson/image/generate/", response_model=ImageGenerateResponse)
 async def generate_image(payload: ImageGenerateRequest):
     ensure_base_capacity()
     service = FlowService()
-    file_data = await service.generate_image(
+    return await service.generate_image(
         topic=payload.topic.strip(),
-        subject=payload.subject.strip(),
-        language=payload.language.strip(),
-        level=payload.level.strip(),
+        subject=payload.subject.strip().lower(),
         section=payload.section.model_dump(),
-        image_prompt=payload.image_prompt.strip(),
+        image_goal=payload.image_goal.strip(),
         style=payload.style.strip(),
         aspect_ratio=payload.aspect_ratio.strip(),
     )
-    return {"file": file_data}
