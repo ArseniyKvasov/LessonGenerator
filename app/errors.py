@@ -1,22 +1,38 @@
-class AppError(Exception):
-    code = "app_error"
+from __future__ import annotations
 
-    def __init__(self, message: str):
+from typing import Any
+
+
+class AppError(Exception):
+    code = "internal_error"
+    status_code = 500
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None):
         super().__init__(message)
         self.message = message
+        self.details = details
 
 
 class ConfigError(AppError):
-    code = "config_error"
+    code = "internal_error"
+    status_code = 500
 
 
 class ProxyError(AppError):
-    code = "proxy_error"
+    code = "internal_error"
+    status_code = 500
 
 
 class FlowGenerationError(AppError):
-    code = "flow_generation_error"
+    code = "invalid_generation_result"
+    status_code = 422
 
 
 class ModelUnavailableError(AppError):
-    code = "model_unavailable_error"
+    code = "internal_error"
+    status_code = 500
+
+
+class InvalidRequestError(AppError):
+    code = "invalid_request"
+    status_code = 400

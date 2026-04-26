@@ -1,101 +1,224 @@
-# API Contract
+# ML Service API Contract
 
 Base URL: `/`
 
-## Общие правила
-- Все ошибки возвращаются в едином формате `ErrorResponse`.
-- В каждый ответ добавляется заголовок `X-Request-ID`.
-- Можно передать свой `X-Request-ID` в запросе для трассировки.
-- Все эндпоинты требуют API ключ.
+## Common Error Format
+```json
+{
+  "error": {
+    "code": "invalid_generation_result",
+    "message": "Generated content does not match expected schema.",
+    "details": {
+      "field": "tasks[1].fill_gaps.answers",
+      "reason": "answers count does not match placeholders count"
+    }
+  }
+}
+```
 
-## Авторизация
-Передавайте ключ в одном из заголовков:
-- `X-API-Key: <APP_API_KEY>`
-- `Authorization: Bearer <APP_API_KEY>`
-
-При неверном/отсутствующем ключе вернется `401`.
+Error codes used by this ML service:
+- `400 invalid_request`
+- `401 unauthorized`
+- `422 invalid_generation_result`
+- `500 internal_error`
 
 ## GET `/health/`
-Проверка доступности API и пулов моделей.
+Technical health endpoint for model pools.
 
-### 200 OK
+## POST `/ml/lesson/topic/normalize/`
+
+Request:
 ```json
 {
-  "status": "ok",
-  "simple_available": ["llama-3.1-8b-instant"],
-  "strong_available": ["llama-3.3-70b-versatile"],
-  "simple_unavailable": [],
-  "strong_unavailable": []
+  "user_request": "Present Continuous"
 }
 ```
 
-### 401 Unauthorized
+Response 200:
 ```json
 {
-  "status": "error",
-  "code": "unauthorized",
-  "message": "Valid API key is required",
-  "request_id": "8f6f8a95-9b2e-4580-bec3-7d297fa0f9bd"
+  "topic": "Present Continuous: Form and Usage",
+  "subject": "language"
 }
 ```
 
-### 503 / 500
+## POST `/ml/lesson/outline/create/`
+
+Request:
 ```json
 {
-  "status": "error",
-  "code": "model_unavailable_error",
-  "message": "No available models in required pool(s)...",
-  "request_id": "8f6f8a95-9b2e-4580-bec3-7d297fa0f9bd"
+  "topic": "Present Continuous: Form and Usage",
+  "subject": "language",
+  "language": "english",
+  "level": "A2",
+  "lesson_format": "short"
 }
 ```
 
-## POST `/generate/`
-Генерация структуры урока и заданий.
-
-### Request
+Response 200:
 ```json
 {
-  "request": "Создай интерактивный урок по теме квадратичной функции"
+  "sections": [
+    {
+      "section_id": "form_basics",
+      "title": "Form Basics",
+      "reference": "Subject + am/is/are + verb-ing"
+    }
+  ]
 }
 ```
 
-### 200 OK
-Возвращает `LessonFlowResponse`:
-- `topic`: тема урока
-- `subject`: предмет (`math`, `language`, `physics`, `chemistry`, `other`)
-- `sections`: список разделов
-- `references`: опорные материалы по разделам
-- `section_task_types`: типы задач по разделам
-- `tasks_by_section`: сгенерированные задания
-- `task_contracts`: контракты полей для типов задач
-- `models`: стратегия выбора моделей
+Validation:
+- `sections`: 3-8 items
+- `section_id`: unique slug
+- `title`: 1-3 words
+- `reference`: short teaching reference
 
-### 422 Validation Error
+## POST `/ml/lesson/outline/improve/`
+
+Request:
 ```json
 {
-  "status": "error",
-  "code": "validation_error",
-  "message": "Request payload is invalid",
-  "request_id": "fca6a47e-e1be-44cc-b60f-145f6eb11d2a"
+  "topic": "Present Continuous: Form and Usage",
+  "subject": "language",
+  "language": "english",
+  "level": "A2",
+  "lesson_format": "short",
+  "current_sections": [
+    {
+      "section_id": "form_basics",
+      "title": "Form Basics",
+      "reference": "Subject + am/is/are + verb-ing"
+    }
+  ],
+  "improvement_prompt": "Add more speaking practice and make it easier"
 }
 ```
 
-### 503 Service Unavailable
+Response 200:
 ```json
 {
-  "status": "error",
-  "code": "flow_generation_error",
-  "message": "Step sections failed after 3 attempts...",
-  "request_id": "fca6a47e-e1be-44cc-b60f-145f6eb11d2a"
+  "sections": [
+    {
+      "section_id": "form_basics",
+      "title": "Form Basics",
+      "reference": "Subject + am/is/are + verb-ing"
+    }
+  ]
 }
 ```
 
-### 500 Internal Server Error
+## POST `/ml/lesson/section/task-types/`
+
+Request:
 ```json
 {
-  "status": "error",
-  "code": "internal_server_error",
-  "message": "Unexpected server error",
-  "request_id": "fca6a47e-e1be-44cc-b60f-145f6eb11d2a"
+  "topic": "Present Continuous: Form and Usage",
+  "subject": "language",
+  "language": "english",
+  "level": "A2",
+  "section": {
+    "section_id": "form_basics",
+    "title": "Form Basics",
+    "reference": "Subject + am/is/are + verb-ing"
+  },
+  "available_task_types": [
+    "note",
+    "test",
+    "true_false",
+    "file",
+    "match_cards",
+    "word_list",
+    "fill_gaps"
+  ]
+}
+```
+
+Response 200:
+```json
+{
+  "section_id": "form_basics",
+  "task_types": ["note", "fill_gaps"]
+}
+```
+
+Validation:
+- `task_types`: 1-3 items
+- each type must be from `available_task_types`
+
+## POST `/ml/lesson/section/generate/`
+
+Request:
+```json
+{
+  "topic": "Present Continuous: Form and Usage",
+  "subject": "language",
+  "language": "english",
+  "level": "A2",
+  "section": {
+    "section_id": "form_basics",
+    "title": "Form Basics",
+    "reference": "Subject + am/is/are + verb-ing",
+    "task_types": ["note", "fill_gaps"]
+  },
+  "previous_sections": [],
+  "task_schemas": {
+    "note": { "content": "str markdown" },
+    "fill_gaps": {
+      "content": "str markdown with {{answer}}",
+      "answers": ["str"]
+    }
+  }
+}
+```
+
+Response 200:
+```json
+{
+  "section_id": "form_basics",
+  "tasks": [
+    {
+      "note": {
+        "content": "Use **am/is/are + verb-ing** to form the Present Continuous."
+      }
+    }
+  ],
+  "image_requests": [
+    {
+      "task_index": 0,
+      "image_prompt": "A clean educational illustration of a classroom."
+    }
+  ]
+}
+```
+
+## POST `/ml/lesson/file/image/generate/`
+
+Request:
+```json
+{
+  "topic": "Present Continuous: Form and Usage",
+  "subject": "language",
+  "language": "english",
+  "level": "A2",
+  "section": {
+    "section_id": "speaking_practice",
+    "title": "Speaking Practice",
+    "reference": "Describe current actions using Present Continuous"
+  },
+  "image_prompt": "A clean educational illustration of a classroom where students are reading, writing, and talking.",
+  "style": "clean educational illustration",
+  "aspect_ratio": "16:9"
+}
+```
+
+Response 200:
+```json
+{
+  "file": {
+    "file_url": "https://cdn.example.com/generated/classroom-actions.png",
+    "file_type": "image",
+    "alt": "Students are doing different activities in a classroom."
+  }
 }
 ```
